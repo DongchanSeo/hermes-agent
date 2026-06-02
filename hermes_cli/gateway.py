@@ -5880,12 +5880,41 @@ def _maybe_redirect_run_to_s6_supervision(args) -> bool:
     # Block until the container is signalled. The supervised gateway's
     # lifetime is independent of this process — s6-supervise restarts
     # it on crash, and we don't want the container to exit when the
-    # gateway flaps. `sleep infinity` matches the static main-hermes
-    # service's pattern (see docker/s6-rc.d/main-hermes/run): the CMD
-    # process is a no-op heartbeat that keeps /init alive until
-    # `docker stop` sends SIGTERM, at which point /init runs stage 3
-    # shutdown (which tears down the supervised gateway cleanly).
-    os.execvp("sleep", ["sleep", "infinity"])
+    # gateway flaps. The CMD process is a no-op heartbeat that keeps
+    # /init alive until `docker stop` sends SIGTERM, at which point
+    # /init runs stage 3 shutdown (which tears down the supervised
+    # gateway cleanly).
+    #
+    # We block in-process with signal.pause() rather than
+    # os.execvp("sleep", ...).  The exec form did a PATH lookup for the
+    # `sleep` binary and crashed the whole container with
+    # FileNotFoundError when PATH was empty/truncated/clobbered at this
+    # point — e.g. after user customizations rewrote PATH, or on minimal
+    # images without a `sleep` on PATH (issue #36208).  Blocking on a
+    # signal needs no external binary, so it can't fail that way.
+    _block_until_terminated()
+    return True  # unreachable; _block_until_terminated() blocks forever
+
+
+def _block_until_terminated() -> None:
+    """Keep the s6 CMD process alive until the container is stopped.
+
+    Installs a SIGTERM handler that exits with the conventional
+    128+signum code so `docker stop` produces a clean, expected exit,
+    then blocks on signal.pause().  Falls back to threading.Event().wait()
+    on platforms without signal.pause() (e.g. Windows) — although this
+    path only runs inside the s6 Linux container image, the fallback
+    keeps the helper safe to import and unit-test anywhere.
+    """
+    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
+    pause = getattr(signal, "pause", None)
+    if pause is not None:
+        while True:
+            pause()
+    else:  # pragma: no cover - non-Unix fallback, not exercised in the s6 image
+        import threading
+
+        threading.Event().wait()
 
 
 def _gateway_command_inner(args):
